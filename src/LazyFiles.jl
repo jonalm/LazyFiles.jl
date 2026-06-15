@@ -4,7 +4,7 @@ using Downloads
 using Rclone_jll
 
 public Config, LazyS3Blob, LazyArtifact, s3_upload, s3_search, clear_from_cache,
-    validate_s3_config, default_config!, config_from_env
+    validate_s3_config, validate_minimal_config, default_config!, config_from_env
 
 # ---------------------------------------------------------------------------
 # Config
