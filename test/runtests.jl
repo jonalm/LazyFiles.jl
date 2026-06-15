@@ -1,4 +1,6 @@
 using Test
+import Downloads
+using Sockets
 import LazyFiles
 using LazyFiles: Config, LazyS3Blob, LazyArtifact, s3_upload, s3_search, clear_from_cache, config_from_env
 
@@ -47,6 +49,23 @@ presign(b) = String(
     )
 )
 
+# One-shot localhost HTTP server: accepts a single connection and replies with
+# the given status line (and an empty body). Lets the offline tests exercise the
+# 404-vs-real-error split in LazyArtifact without any network or live bucket.
+function serve_once(status_line)
+    server = listen(IPv4(0), 0)
+    port = Int(getsockname(server)[2])
+    @async try
+        sock = accept(server)
+        readuntil(sock, "\r\n\r\n")
+        write(sock, "HTTP/1.1 $status_line\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        close(sock)
+    finally
+        close(server)
+    end
+    return port
+end
+
 # Best-effort teardown so re-runs stay idempotent and the bucket stays clean.
 function cleanup(blobs...)
     for b in blobs
@@ -89,10 +108,42 @@ end
             s3_secret_access_key = "b", s3_region = "r"
         )
         @test_throws ErrorException LazyS3Blob(bucket = "b", name = "../../escape")(; config = okcreds)
+        # an absolute-path name must not escape the cache directory either
+        @test_throws ErrorException LazyS3Blob(bucket = "b", name = "/etc/passwd")(; config = okcreds)
 
         # LazyArtifact needs a cache dir but no S3 credentials
         @test_throws ErrorException LazyArtifact(url = "http://x", name = "n")(; config = Config())
-        @test LazyArtifact(url = "http://127.0.0.1:1/nope", name = "x.bin")(; config = nocreds) === nothing
+
+        # an artifact resolves to `nothing` only on a genuine 404 ...
+        p404 = serve_once("404 Not Found")
+        @test LazyArtifact(url = "http://127.0.0.1:$p404/x", name = "a404.bin")(; config = nocreds) === nothing
+        # ... any other failure surfaces rather than masquerading as "not found"
+        @test_throws Downloads.RequestError LazyArtifact(url = "http://127.0.0.1:1/nope", name = "aconn.bin")(; config = nocreds)
+        p500 = serve_once("500 Internal Server Error")
+        @test_throws Downloads.RequestError LazyArtifact(url = "http://127.0.0.1:$p500/y", name = "a500.bin")(; config = nocreds)
+
+        # clear_from_cache reports an unset cache dir clearly (not as a path-escape)
+        @test_throws ErrorException clear_from_cache(LazyS3Blob(bucket = "b", name = "n"); config = Config())
+    end
+
+    @testset "non-portable keys are refused (offline)" begin
+        cfg = Config(
+            local_cache_dir = mktempdir(), s3_access_key_id = "a",
+            s3_secret_access_key = "b", s3_region = "r",
+        )
+        resolve(name) = LazyS3Blob(bucket = "b", name = name)(; config = cfg)
+        # backslash, Windows-illegal chars, reserved device names, trailing dot/space:
+        # rejected before any network is touched
+        for bad in ("a\\b.bin", "a:b.bin", "logs/*.txt", "q?.txt", "a<b", "a|b",
+                "data/NUL", "CON.txt", "name.", "name ", "a\tb")
+            @test_throws ErrorException resolve(bad)
+        end
+        # a bucket name carrying a backslash is refused too
+        @test_throws ErrorException LazyS3Blob(bucket = "a\\b", name = "k")(; config = cfg)
+        # ordinary nested keys, dotfiles and multi-dot names are NOT false positives
+        @test LazyFiles._check_portable_name("bucket", "dir/sub/file.bin") === nothing
+        @test LazyFiles._check_portable_name("bucket", ".gitignore") === nothing
+        @test LazyFiles._check_portable_name("bucket", "report.final.txt") === nothing
     end
 
     if !LazyFiles.is_valid_s3_config(CFG)
@@ -176,6 +227,29 @@ end
                 @test Set(b.name for b in txt) == Set([n1])
             finally
                 cleanup(b1, b2)
+            end
+        end
+
+        @testset "s3_search narrows by server-side prefix" begin
+            pre = "prefix-$RID"
+            n1 = "$pre/x/one.txt"; n2 = "$pre/x/two.txt"; n3 = "$pre/y/three.txt"
+            f = tempname(); write(f, "p")
+            b1 = s3_upload(f, BUCKET, n1; config = CFG)
+            b2 = s3_upload(f, BUCKET, n2; config = CFG)
+            b3 = s3_upload(f, BUCKET, n3; config = CFG)
+            try
+                under_x = s3_search(BUCKET; prefix = "$pre/x", config = CFG)
+                # full keys are reconstructed (not relative to the prefix); y/ excluded
+                @test Set(b.name for b in under_x) == Set([n1, n2])
+                # a reconstructed blob actually resolves, proving the key is the full key
+                @test read(first(under_x)(; config = CFG), String) == "p"
+                # a prefix matching nothing is an empty vector, not an error
+                @test isempty(s3_search(BUCKET; prefix = "$pre/zzz", config = CFG))
+                # prefix and regex compose; the regex matches against the full key
+                one = s3_search(BUCKET, Regex("one\\.txt"); prefix = "$pre/x", config = CFG)
+                @test Set(b.name for b in one) == Set([n1])
+            finally
+                cleanup(b1, b2, b3)
             end
         end
 
@@ -263,9 +337,9 @@ end
                     end
                 end
 
-                @testset "failed download returns nothing" begin
+                @testset "a transport failure raises (not silently nothing)" begin
                     a = LazyArtifact(url = "http://127.0.0.1:1/nope", name = "artfail-$RID.bin")
-                    @test a(; config = CFG) === nothing
+                    @test_throws Downloads.RequestError a(; config = CFG)
                 end
 
                 @testset "clear_from_cache works on artifacts" begin

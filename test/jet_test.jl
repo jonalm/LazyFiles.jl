@@ -55,6 +55,8 @@ const JART  = LazyArtifact(url = "http://example.invalid/x.bin", name = "x.bin")
         @test_opt target_modules = TM s3_upload("/tmp/f", "bucket")          # name defaulted
         @test_opt target_modules = TM s3_search("bucket")                    # no regex
         @test_opt target_modules = TM s3_search("bucket", r"\.txt$")         # with regex
+        @test_opt target_modules = TM s3_search("bucket"; prefix = "a/b")    # server-side prefix
+        @test_opt target_modules = TM s3_search("bucket", r"\.txt$"; prefix = "a/b")
         @test_opt target_modules = TM clear_from_cache(JBLOB; config = JCFG)
         @test_opt target_modules = TM clear_from_cache(JART; config = JCFG)
     end

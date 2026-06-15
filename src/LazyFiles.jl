@@ -24,9 +24,45 @@ local_cache_dir(c::Config) = c.local_cache_dir
 # Maximum seconds a single artifact download may take (rclone has its own timeouts).
 const ARTIFACT_TIMEOUT = 300
 
+# DOS device names reserved by Windows; illegal as a path component (with or
+# without an extension) even though they are valid S3 keys / POSIX filenames.
+const _WIN_RESERVED_NAMES = Set([
+    "CON", "PRN", "AUX", "NUL",
+    ("COM$i" for i in 1:9)...,
+    ("LPT$i" for i in 1:9)...,
+])
+
+# Reject bucket names / object keys that resolve to a valid path on POSIX but
+# behave differently — or are outright illegal — on Windows, so a handle that
+# caches on one OS caches on every OS instead of silently diverging or failing
+# only on Windows. `/` is allowed: it is the portable key delimiter and maps to
+# nested cache dirs everywhere.
+function _check_portable_name(parts...)
+    for part in parts
+        for seg in split(part, '/'; keepempty = false)
+            # `\` is a literal char on POSIX but a path separator on Windows.
+            occursin('\\', seg) &&
+                error("name not portable to Windows (contains a backslash): \"$seg\"")
+            # Control chars and the characters Windows forbids in a path component.
+            i = findfirst(c -> c < ' ' || c in ('<', '>', ':', '"', '|', '?', '*'), seg)
+            isnothing(i) ||
+                error("name not portable to Windows (illegal character $(repr(seg[i]))): \"$seg\"")
+            # Windows silently strips a trailing dot or space from a component.
+            (endswith(seg, '.') || endswith(seg, ' ')) &&
+                error("name not portable to Windows (trailing dot or space): \"$seg\"")
+            # Reserved device name, with or without an extension (CON, CON.txt).
+            uppercase(first(split(seg, '.'))) in _WIN_RESERVED_NAMES &&
+                error("name not portable to Windows (reserved device name): \"$seg\"")
+        end
+    end
+    return nothing
+end
+
 # Resolve a cache path, refusing names that escape the cache directory (e.g. a
-# blob name containing `..` or an absolute path).
+# blob name containing `..` or an absolute path) or that aren't portable across
+# operating systems.
 function _checked_path(base::AbstractString, parts...)
+    _check_portable_name(parts...)
     full = normpath(joinpath(base, parts...))
     root = normpath(base)
     sep = Base.Filesystem.path_separator
@@ -105,11 +141,13 @@ end
 
 """
     a = LazyArtifact(; url, name)
-    a()  -> resolves to a local path, downloading on a cache miss; `nothing` on failure
+    a()  -> resolves to a local path, downloading on a cache miss; `nothing` if absent
 
 A handle to a file at an HTTP(S) `url`. Calling it returns the path to a local
 copy (cached under `<cache>/_artifacts_/<name>`), downloading on first use.
 Only `local_cache_dir` is required in the config — no S3 credentials.
+Returns `nothing` only when the URL responds `404 Not Found`; a genuine failure
+(network, timeout, 5xx, …) raises rather than masquerading as "not found".
 """
 Base.@kwdef struct LazyArtifact <: AbstractLazyBlob
     url::String
@@ -129,9 +167,16 @@ function (a::LazyArtifact)(; config::Config = DEFAULT_CONFIG[], verbose::Bool = 
     try
         Downloads.download(a.url, tmp; timeout)
     catch e
-        verbose && @warn "artifact download failed" url = a.url exception = e
         isfile(tmp) && rm(tmp; force = true)
-        return nothing
+        # A 404 means the artifact genuinely isn't there: return `nothing`,
+        # mirroring the S3 path. Any other failure (network, timeout, 5xx, a
+        # bad cache path) is real and must surface, not look like "not found".
+        if e isa Downloads.RequestError && e.response.status == 404
+            verbose && @warn "artifact not found (404)" url = a.url
+            return nothing
+        end
+        verbose && @warn "artifact download failed" url = a.url exception = e
+        rethrow()
     end
     isfile(tmp) || return nothing
     mv(tmp, lp; force = true)
@@ -164,6 +209,7 @@ Remove the local cached copy of `b`, if present. Returns `true` if a file was
 removed, `false` if there was nothing cached.
 """
 function clear_from_cache(b::AbstractLazyBlob; config::Config = DEFAULT_CONFIG[])
+    is_valid_minimal_config(config) || error("local_cache_dir is not set")
     lp = local_path(config, b)
     isfile(lp) || return false
     rm(lp; force = true)
@@ -188,18 +234,31 @@ function s3_upload(
 end
 
 """
-    s3_search(bucket, regex=nothing; config=DEFAULT_CONFIG[]) -> Vector{LazyS3Blob}
+    s3_search(bucket, regex=nothing; prefix="", config=DEFAULT_CONFIG[]) -> Vector{LazyS3Blob}
 
-List objects in `bucket` (recursively) as `LazyS3Blob` handles. If `regex` is
-given, only objects whose key matches are returned.
+List objects in `bucket` (recursively) as `LazyS3Blob` handles.
+
+`prefix` narrows the listing *on the server* to keys under that `/`-delimited
+key prefix (e.g. `"logs/2024"`), so only that subtree is fetched instead of the
+whole bucket — the one filter S3 itself can apply. A prefix matching nothing
+yields an empty vector. If `regex` is also given, the (already narrowed) keys
+are filtered client-side, matched against the full key.
 """
-function s3_search(bucket::AbstractString, regex::Union{Regex, Nothing} = nothing; config::Config = DEFAULT_CONFIG[], verbose::Bool = false)
+function s3_search(
+        bucket::AbstractString, regex::Union{Regex, Nothing} = nothing;
+        prefix::AbstractString = "", config::Config = DEFAULT_CONFIG[], verbose::Bool = false
+    )
     validate_s3_config(config)
+    # rclone lists the "directory" `bucket/pfx` and returns keys relative to it,
+    # so re-prepend `pfx` to rebuild the full key each LazyS3Blob needs to resolve.
+    pfx = strip(prefix, '/')
+    remote = isempty(pfx) ? "$RCLONE_REMOTE:$bucket" : "$RCLONE_REMOTE:$bucket/$pfx"
     r = _with_rclone(config) do make_cmd
-        _run(make_cmd(`lsf $RCLONE_REMOTE:$bucket --files-only -R`); verbose)
+        _run(make_cmd(`lsf $remote --files-only -R`); verbose)
     end
     r.ok || error("search failed (rclone exit $(r.code)): $(strip(r.err))")
     names = [String(strip(l)) for l in split(r.out, '\n') if !isempty(strip(l))]
+    isempty(pfx) || (names = [string(pfx, '/', n) for n in names])
     isnothing(regex) || filter!(n -> occursin(regex, n), names)
     return [LazyS3Blob(; bucket, name) for name in names]
 end

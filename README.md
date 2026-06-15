@@ -1,5 +1,7 @@
 # LazyFiles
 
+[![CI](https://github.com/jonalm/LazyFiles.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/jonalm/LazyFiles.jl/actions/workflows/CI.yml)
+
 Lazy, cached handles to remote files. A `LazyS3Blob` (object in an S3 bucket) or
 `LazyArtifact` (file at an HTTP URL) resolves to a local path on demand,
 downloading into a local cache on first use and serving from cache thereafter.
@@ -38,6 +40,7 @@ path = blob(; config = cfg)                                 # cache hit: returns
 
 blobs = s3_search("my-bucket"; config = cfg)                # Vector{LazyS3Blob}, every object (recursive)
 csvs  = s3_search("my-bucket", r"\.csv$"; config = cfg)     # filtered by a regex on the key
+logs  = s3_search("my-bucket"; prefix = "logs/2024", config = cfg)  # server-side: only keys under logs/2024/
 
 clear_from_cache(blob; config = cfg)                        # drop the local copy
 ```
@@ -53,8 +56,12 @@ returning `nothing`.
 
 ```julia
 a = LazyArtifact(url = "https://example.com/data.bin", name = "data.bin")
-path = a(; config = cfg)        # downloads to <cache>/_artifacts_/data.bin, or nothing on failure
+path = a(; config = cfg)        # downloads to <cache>/_artifacts_/data.bin
 ```
+
+Like a blob, an artifact resolves to `nothing` only when the URL responds
+`404 Not Found`; a genuine failure (network error, timeout, 5xx) raises rather
+than silently returning `nothing`.
 
 ## Notes
 
@@ -62,6 +69,11 @@ path = a(; config = cfg)        # downloads to <cache>/_artifacts_/data.bin, or 
   success, so an interrupted run never leaves a truncated file in the cache and
   concurrent resolves of the same handle don't clobber each other.
 - The rclone S3 backend is provided by `Rclone_jll` — no system install needed.
+- Bucket names and object keys must be portable across operating systems: `/`
+  delimits nested cache directories, but a name containing a backslash, a
+  character Windows forbids in a path (`<>:"|?*` or a control char), a reserved
+  device name (`CON`, `NUL`, …) or a trailing dot/space is rejected — so a blob
+  that caches on one OS caches on all of them.
 
 ## Tests
 
