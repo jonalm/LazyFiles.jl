@@ -39,12 +39,13 @@ path = blob(; config = cfg)                                 # downloads on first
 path = blob(; config = cfg)                                 # cache hit: returns immediately, no network
 
 blobs = s3_list("my-bucket"; config = cfg)                  # Vector{LazyS3Blob}, every object (recursive)
-csvs  = s3_list("my-bucket", r"\.csv$"; config = cfg)       # filtered by a regex on the key
+csvs  = s3_list(r"\.csv$", "my-bucket"; config = cfg)       # Regex shorthand: filter on the key
+big   = s3_list(e -> e.size > 1024^2, "my-bucket"; config = cfg)  # predicate on the S3Entry record
 logs  = s3_list("my-bucket"; prefix = "logs/2024", config = cfg)  # server-side: only keys under logs/2024/
 
 # Same listing, with each object's size (bytes) and last-modified time:
 stats = s3_list_with_stats("my-bucket"; prefix = "logs/2024", config = cfg)
-# -> Vector{@NamedTuple{blob::LazyS3Blob, size::Int, modified::DateTime}}
+# -> Vector{S3Entry}, i.e. @NamedTuple{blob::LazyS3Blob, size::Int, modified::DateTime}
 latest = argmax(e -> e.modified, stats).blob                # e.g. pick the newest object
 
 clear_from_cache(blob; config = cfg)                        # drop the local copy

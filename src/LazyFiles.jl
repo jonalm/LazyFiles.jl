@@ -5,7 +5,7 @@ using Downloads
 using JSON
 using Rclone_jll
 
-public Config, LazyS3Blob, LazyArtifact, s3_upload, s3_list, s3_list_with_stats,
+public Config, LazyS3Blob, LazyArtifact, S3Entry, s3_upload, s3_list, s3_list_with_stats,
     clear_from_cache, validate_s3_config, validate_minimal_config, default_config!,
     config_from_env
 
@@ -253,6 +253,16 @@ function s3_upload(
     return LazyS3Blob(; bucket, name)
 end
 
+"""
+    S3Entry
+
+One object in a bucket listing: a `blob::LazyS3Blob` handle paired with the
+object's `size` (bytes) and `modified` time (the S3 last-modified timestamp, UTC,
+second resolution). The element type returned by [`s3_list_with_stats`](@ref), and
+the value passed to a listing predicate.
+"""
+const S3Entry = @NamedTuple{blob::LazyS3Blob, size::Int, modified::DateTime}
+
 # The rclone `lsjson` fields we use. JSON's typed parse fills these by name and
 # ignores the rest (Name, IsDir, …); field names match rclone's JSON keys, which
 # is why they're capitalized rather than Julia-style.
@@ -269,18 +279,15 @@ end
 # are dropped — second resolution is enough to order and poll listings.
 _parse_modtime(s::AbstractString) = DateTime(first(s, 19), dateformat"yyyy-mm-ddTHH:MM:SS")
 
-# Turn an `lsjson` listing into (blob, size, modified) records. Factored out of
+# Turn an `lsjson` listing into `S3Entry` records. Factored out of
 # `s3_list_with_stats` so it is unit-testable without rclone. `lsjson -R` reports
 # keys relative to the listed dir, so re-prepend `pfx` to rebuild the full key
-# each LazyS3Blob needs; `regex`, when given, matches against that full key.
-function _parse_lsjson(
-        out::AbstractString, bucket::AbstractString, pfx::AbstractString, regex::Union{Regex, Nothing}
-    )
-    recs = @NamedTuple{blob::LazyS3Blob, size::Int, modified::DateTime}[]
+# each LazyS3Blob needs (the full key is what a listing predicate later sees).
+function _parse_lsjson(out::AbstractString, bucket::AbstractString, pfx::AbstractString)
+    recs = S3Entry[]
     isempty(strip(out)) && return recs
     for o in JSON.parse(out, Vector{_LsObject})::Vector{_LsObject}
         name = isempty(pfx) ? o.Path : string(pfx, '/', o.Path)
-        isnothing(regex) || occursin(regex, name) || continue
         push!(
             recs, (;
                 blob = LazyS3Blob(; bucket, name),
@@ -293,19 +300,32 @@ function _parse_lsjson(
 end
 
 """
-    s3_list_with_stats(bucket, regex=nothing; prefix="", config=DEFAULT_CONFIG[])
-        -> Vector{@NamedTuple{blob::LazyS3Blob, size::Int, modified::DateTime}}
+    s3_list_with_stats([pred,] bucket; prefix="", config=DEFAULT_CONFIG[]) -> Vector{S3Entry}
 
-List objects in `bucket` (recursively) together with each object's `size` (bytes)
-and `modified` time (the S3 last-modified timestamp, UTC, second resolution).
+List objects in `bucket` (recursively) as [`S3Entry`](@ref) records, each pairing a
+`LazyS3Blob` handle with the object's `size` (bytes) and `modified` time (the S3
+last-modified timestamp, UTC, second resolution).
 
-`prefix` and `regex` filter exactly as in [`s3_list`](@ref): `prefix` narrows the
-listing on the server, `regex` filters the returned keys client-side against the
-full key. This is the underlying listing primitive; [`s3_list`](@ref) is this call
-projected down to just the `blob` handles.
+`prefix` narrows the listing *on the server* to keys under that `/`-delimited key
+prefix (e.g. `"logs/2024"`), so only that subtree is fetched instead of the whole
+bucket — the one filter S3 itself can apply. A prefix matching nothing yields an
+empty vector.
+
+`pred` filters the records *client-side*, after the listing returns:
+`pred(::S3Entry)::Bool` keeps the entries for which it returns `true`, so it can
+select on name, size and time together. As a shorthand, a `Regex` given in `pred`'s
+place matches against each full key, i.e. `s3_list_with_stats(r, bucket)` ==
+`s3_list_with_stats(e -> occursin(r, e.blob.name), bucket)`.
+
+    # .csv objects over 1 MiB, modified this year
+    s3_list_with_stats(bucket) do e
+        endswith(e.blob.name, ".csv") && e.size > 1024^2 && e.modified > DateTime(2024)
+    end
+
+[`s3_list`](@ref) is this call projected down to just the `blob` handles.
 """
 function s3_list_with_stats(
-        bucket::AbstractString, regex::Union{Regex, Nothing} = nothing;
+        bucket::AbstractString;
         prefix::AbstractString = "", config::Config = DEFAULT_CONFIG[], verbose::Bool = false
     )
     validate_s3_config(config)
@@ -316,25 +336,35 @@ function s3_list_with_stats(
         _run(make_cmd(`lsjson $remote --files-only -R --use-server-modtime`); verbose)
     end
     r.ok || error("list failed (rclone exit $(r.code)): $(strip(r.err))")
-    return _parse_lsjson(r.out, bucket, pfx, regex)
+    return _parse_lsjson(r.out, bucket, pfx)
 end
 
+# Optional client-side filter over the full listing. A bare predicate sees the
+# whole `S3Entry`; a `Regex` is sugar for matching it against the full key.
+s3_list_with_stats(pred, bucket::AbstractString; kwargs...) =
+    filter(pred, s3_list_with_stats(bucket; kwargs...))
+
+s3_list_with_stats(re::Regex, bucket::AbstractString; kwargs...) =
+    s3_list_with_stats(e -> occursin(re, e.blob.name), bucket; kwargs...)
+
 """
-    s3_list(bucket, regex=nothing; prefix="", config=DEFAULT_CONFIG[]) -> Vector{LazyS3Blob}
+    s3_list([pred,] bucket; prefix="", config=DEFAULT_CONFIG[]) -> Vector{LazyS3Blob}
 
-List objects in `bucket` (recursively) as `LazyS3Blob` handles.
+List objects in `bucket` (recursively) as `LazyS3Blob` handles. `prefix`, the
+optional `pred`, and the `Regex` shorthand all filter exactly as in
+[`s3_list_with_stats`](@ref); this is that call projected to just the handles.
 
-`prefix` narrows the listing *on the server* to keys under that `/`-delimited key
-prefix (e.g. `"logs/2024"`), so only that subtree is fetched instead of the whole
-bucket — the one filter S3 itself can apply. A prefix matching nothing yields an
-empty vector. If `regex` is also given, the (already narrowed) keys are filtered
-client-side, matched against the full key.
+    s3_list(bucket)                           # every object
+    s3_list(r"\\.txt\$", bucket)                # keys ending in .txt
+    s3_list(e -> e.size > 1024^2, bucket)     # objects larger than 1 MiB
 
 Use [`s3_list_with_stats`](@ref) when you also need each object's size and
 last-modified time.
 """
-s3_list(bucket::AbstractString, regex::Union{Regex, Nothing} = nothing; kwargs...) =
-    [e.blob for e in s3_list_with_stats(bucket, regex; kwargs...)]
+s3_list(bucket::AbstractString; kwargs...) =
+    [e.blob for e in s3_list_with_stats(bucket; kwargs...)]
+s3_list(pred, bucket::AbstractString; kwargs...) =
+    [e.blob for e in s3_list_with_stats(pred, bucket; kwargs...)]
 
 # ---------------------------------------------------------------------------
 # rclone backend

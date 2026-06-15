@@ -53,12 +53,14 @@ const JART  = LazyArtifact(url = "http://example.invalid/x.bin", name = "x.bin")
     @testset "public operations" begin
         @test_opt target_modules = TM s3_upload("/tmp/f", "bucket", "name")
         @test_opt target_modules = TM s3_upload("/tmp/f", "bucket")          # name defaulted
-        @test_opt target_modules = TM s3_list("bucket")                      # no regex
-        @test_opt target_modules = TM s3_list("bucket", r"\.txt$")           # with regex
+        @test_opt target_modules = TM s3_list("bucket")                      # no filter
+        @test_opt target_modules = TM s3_list(r"\.txt$", "bucket")           # regex shorthand
+        @test_opt target_modules = TM s3_list(e -> e.size > 0, "bucket")     # function predicate
         @test_opt target_modules = TM s3_list("bucket"; prefix = "a/b")      # server-side prefix
-        @test_opt target_modules = TM s3_list("bucket", r"\.txt$"; prefix = "a/b")
+        @test_opt target_modules = TM s3_list(r"\.txt$", "bucket"; prefix = "a/b")
         @test_opt target_modules = TM s3_list_with_stats("bucket")
-        @test_opt target_modules = TM s3_list_with_stats("bucket", r"\.txt$"; prefix = "a/b")
+        @test_opt target_modules = TM s3_list_with_stats(e -> e.size > 0, "bucket")
+        @test_opt target_modules = TM s3_list_with_stats(r"\.txt$", "bucket"; prefix = "a/b")
         @test_opt target_modules = TM clear_from_cache(JBLOB; config = JCFG)
         @test_opt target_modules = TM clear_from_cache(JART; config = JCFG)
     end
@@ -67,6 +69,6 @@ const JART  = LazyArtifact(url = "http://example.invalid/x.bin", name = "x.bin")
         @test_opt target_modules = TM LazyFiles._run(`true`)
         @test_opt target_modules = TM LazyFiles._write_rclone_config(IOBuffer(), JCFG)
         @test_opt target_modules = TM LazyFiles._parse_modtime("2024-01-02T12:00:00.0Z")
-        @test_opt target_modules = TM LazyFiles._parse_lsjson("[]", "bucket", "", nothing)
+        @test_opt target_modules = TM LazyFiles._parse_lsjson("[]", "bucket", "")
     end
 end
