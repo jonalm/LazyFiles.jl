@@ -47,9 +47,11 @@ function _check_portable_name(parts...)
             i = findfirst(c -> c < ' ' || c in ('<', '>', ':', '"', '|', '?', '*'), seg)
             isnothing(i) ||
                 error("name not portable to Windows (illegal character $(repr(seg[i]))): \"$seg\"")
-            # Windows silently strips a trailing dot or space from a component.
-            (endswith(seg, '.') || endswith(seg, ' ')) &&
-                error("name not portable to Windows (trailing dot or space): \"$seg\"")
+            # Windows trims a leading space (Explorer) and a trailing dot or
+            # space (the path API) from a component, so such a name would cache
+            # under a different filename there — reject rather than diverge.
+            (startswith(seg, ' ') || endswith(seg, '.') || endswith(seg, ' ')) &&
+                error("name not portable to Windows (leading/trailing space or trailing dot): \"$seg\"")
             # Reserved device name, with or without an extension (CON, CON.txt).
             uppercase(first(split(seg, '.'))) in _WIN_RESERVED_NAMES &&
                 error("name not portable to Windows (reserved device name): \"$seg\"")
@@ -196,7 +198,15 @@ function _prune_empty_dirs(dir::AbstractString, root::AbstractString)
     prefix = endswith(root, sep) ? root : root * sep
     dir = normpath(dir)
     while dir != root && startswith(dir, prefix) && isdir(dir) && isempty(readdir(dir))
-        rm(dir)
+        try
+            rm(dir)
+        catch
+            # Racing a concurrent resolve that repopulated this dir (ENOTEMPTY) or
+            # another pruner that already removed it (ENOENT): pruning empty dirs
+            # is a tidy-up, not required for correctness, so stop rather than fail
+            # the cache-clear over a directory we don't strictly need to delete.
+            break
+        end
         dir = dirname(dir)
     end
     return nothing
@@ -224,6 +234,10 @@ function s3_upload(
     validate_s3_config(config)
     isfile(local_file) || error("not a file: $local_file")
     name = isnothing(name) ? basename(local_file) : name
+    # Refuse a bucket/key the returned handle could never resolve (resolve applies
+    # the same check). Fail here, before the upload, instead of stranding an object
+    # in S3 that this package can't read back.
+    _check_portable_name(bucket, name)
     # `--` stops rclone flag parsing so a local_file beginning with `-` is
     # treated as a path, not a flag.
     r = _with_rclone(config) do make_cmd
@@ -232,6 +246,14 @@ function s3_upload(
     r.ok || error("upload failed (rclone exit $(r.code)): $(strip(r.err))")
     return LazyS3Blob(; bucket, name)
 end
+
+# Parse rclone `lsf` output into keys: one per line. Drop only the line
+# terminator (a stray `\r`) — never surrounding spaces, which are legitimate (if
+# non-portable) parts of an S3 key, so trimming them would resolve a *different*
+# object. A key containing a newline can't be represented in this line-based
+# listing; switch to `lsjson` if that ever matters.
+_parse_lsf(out::AbstractString) =
+    String[String(s) for s in (rstrip(l, '\r') for l in split(out, '\n')) if !isempty(s)]
 
 """
     s3_search(bucket, regex=nothing; prefix="", config=DEFAULT_CONFIG[]) -> Vector{LazyS3Blob}
@@ -257,7 +279,7 @@ function s3_search(
         _run(make_cmd(`lsf $remote --files-only -R`); verbose)
     end
     r.ok || error("search failed (rclone exit $(r.code)): $(strip(r.err))")
-    names = [String(strip(l)) for l in split(r.out, '\n') if !isempty(strip(l))]
+    names = _parse_lsf(r.out)
     isempty(pfx) || (names = [string(pfx, '/', n) for n in names])
     isnothing(regex) || filter!(n -> occursin(regex, n), names)
     return [LazyS3Blob(; bucket, name) for name in names]

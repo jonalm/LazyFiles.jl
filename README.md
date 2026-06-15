@@ -72,11 +72,28 @@ than silently returning `nothing`.
 - Bucket names and object keys must be portable across operating systems: `/`
   delimits nested cache directories, but a name containing a backslash, a
   character Windows forbids in a path (`<>:"|?*` or a control char), a reserved
-  device name (`CON`, `NUL`, …) or a trailing dot/space is rejected — so a blob
-  that caches on one OS caches on all of them.
+  device name (`CON`, `NUL`, …), or a leading/trailing space or trailing dot is
+  rejected — so a blob that caches on one OS caches on all of them. The same
+  check runs at upload time, so `s3_upload` can't strand an object under a key
+  the handle it returns could never resolve.
 
 ## Tests
 
 `Pkg.test("LazyFiles")` runs offline checks unconditionally. The live S3 tests
 run only when usable credentials are present (see `test/runtests.jl`); otherwise
 they are skipped.
+
+Credentials are read from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
+`AWS_REGION` in the environment. To run the live tests without keeping keys in a
+file, store them in your OS keychain with
+[`aws-vault`](https://github.com/99designs/aws-vault) and inject them for a
+single run:
+
+```sh
+aws-vault exec lazyfiles-test --no-session -- \
+    julia --project -e 'using Pkg; Pkg.test()'
+```
+
+`--no-session` is required: the S3 backend authenticates with a static access
+key and does not read `AWS_SESSION_TOKEN`, so temporary/STS credentials —
+aws-vault's default, AWS SSO, and MFA-gated sessions — won't work.

@@ -64,5 +64,6 @@ const JART  = LazyArtifact(url = "http://example.invalid/x.bin", name = "x.bin")
     @testset "rclone backend internals" begin
         @test_opt target_modules = TM LazyFiles._run(`true`)
         @test_opt target_modules = TM LazyFiles._write_rclone_config(IOBuffer(), JCFG)
+        @test_opt target_modules = TM LazyFiles._parse_lsf("a\nb/c\n")
     end
 end
