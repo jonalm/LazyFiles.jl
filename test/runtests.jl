@@ -93,6 +93,10 @@ end
                 s3_secret_access_key = "b", s3_region = "r"
             )
         ) == true
+
+        # validate_minimal_config: only local_cache_dir matters (no S3 creds needed)
+        @test_throws ErrorException LazyFiles.validate_minimal_config(Config())
+        @test LazyFiles.validate_minimal_config(Config(local_cache_dir = "/tmp")) == true
     end
 
     @testset "operations enforce config (offline)" begin
@@ -132,10 +136,10 @@ end
             s3_secret_access_key = "b", s3_region = "r",
         )
         resolve(name) = LazyS3Blob(bucket = "b", name = name)(; config = cfg)
-        # backslash, Windows-illegal chars, reserved device names, trailing dot/space:
-        # rejected before any network is touched
+        # backslash, Windows-illegal chars, reserved device names, leading/trailing
+        # space, trailing dot: rejected before any network is touched
         for bad in ("a\\b.bin", "a:b.bin", "logs/*.txt", "q?.txt", "a<b", "a|b",
-                "data/NUL", "CON.txt", "name.", "name ", "a\tb")
+                "data/NUL", "CON.txt", "name.", "name ", " name", "a\tb")
             @test_throws ErrorException resolve(bad)
         end
         # a bucket name carrying a backslash is refused too
@@ -144,6 +148,27 @@ end
         @test LazyFiles._check_portable_name("bucket", "dir/sub/file.bin") === nothing
         @test LazyFiles._check_portable_name("bucket", ".gitignore") === nothing
         @test LazyFiles._check_portable_name("bucket", "report.final.txt") === nothing
+
+        # s3_upload applies the same gate up front, so it can't strand an object
+        # under a key the handle it returns could never resolve (checked before
+        # any network: these throw despite cfg's creds being usable-looking).
+        f = tempname(); write(f, "x")
+        @test_throws ErrorException s3_upload(f, "b", "CON.txt"; config = cfg)
+        @test_throws ErrorException s3_upload(f, "b", "trailing "; config = cfg)
+        @test_throws ErrorException s3_upload(f, "a\\b", "k"; config = cfg)
+    end
+
+    @testset "lsf parsing keeps significant whitespace (offline)" begin
+        # CRLF terminators dropped and the trailing empty line ignored, but spaces
+        # that are part of a key are preserved — trimming would resolve a *different*
+        # object. (Leading/trailing-space keys are non-portable and refused at
+        # resolve; preserving them here means that refusal is honest, not a key the
+        # listing silently rewrote.)
+        out = "a.txt\r\nb/c.bin\r\n leading.txt\r\ntrailing .txt\r\n"
+        @test LazyFiles._parse_lsf(out) == ["a.txt", "b/c.bin", " leading.txt", "trailing .txt"]
+        @test LazyFiles._parse_lsf("") == String[]
+        @test LazyFiles._parse_lsf("only\n") == ["only"]
+        @test LazyFiles._parse_lsf("no-terminator") == ["no-terminator"]
     end
 
     if !LazyFiles.is_valid_s3_config(CFG)
