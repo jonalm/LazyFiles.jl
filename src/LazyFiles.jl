@@ -4,7 +4,7 @@ using Downloads
 using Rclone_jll
 
 public Config, LazyS3Blob, LazyArtifact, s3_upload, s3_search, clear_from_cache,
-       validate_s3_config, default_config!, config_from_env
+    validate_s3_config, default_config!, config_from_env
 
 # ---------------------------------------------------------------------------
 # Config
@@ -69,6 +69,8 @@ abstract type AbstractLazyBlob end
 
 A handle to an object in an S3 bucket. Calling it returns the path to a local
 copy (under the config's cache dir), downloading the object on first use.
+Returns `nothing` only when the object does not exist; a genuine failure
+(auth, missing bucket, network) raises.
 """
 Base.@kwdef struct LazyS3Blob <: AbstractLazyBlob
     bucket::String
@@ -82,14 +84,21 @@ function (b::LazyS3Blob)(; config::Config = DEFAULT_CONFIG[], verbose::Bool = fa
     lp = local_path(config, b)
     isfile(lp) && return lp
     mkpath(dirname(lp))
-    tmp = lp * ".partial"          # download out-of-place so an interrupted run never caches a partial
+    # Download to a unique temp in the same dir, then rename: an interrupted run
+    # never caches a partial, and concurrent resolves of the same blob don't
+    # clobber each other's download. `cleanup=false`: we manage its lifecycle.
+    tmp = tempname(dirname(lp); cleanup = false)
     r = _with_rclone(config) do make_cmd
         _run(make_cmd(`copyto $RCLONE_REMOTE:$(b.bucket)/$(b.name) $tmp`); verbose)
     end
-    if !(r.ok && isfile(tmp))
+    # rclone `copyto` exits 0 and writes nothing when the object is absent; a
+    # nonzero exit is a real failure (auth, missing bucket, network) and must
+    # be surfaced rather than masquerading as "not found".
+    if !r.ok
         isfile(tmp) && rm(tmp; force = true)
-        return nothing
+        error("download failed (rclone exit $(r.code)): $(strip(r.err))")
     end
+    isfile(tmp) || return nothing
     mv(tmp, lp; force = true)
     return lp
 end
@@ -114,7 +123,9 @@ function (a::LazyArtifact)(; config::Config = DEFAULT_CONFIG[], verbose::Bool = 
     lp = local_path(config, a)
     isfile(lp) && return lp
     mkpath(dirname(lp))
-    tmp = lp * ".partial"          # download out-of-place so an interrupted run never caches a partial
+    # Unique temp in the same dir, renamed on success: an interrupted run never
+    # caches a partial, and concurrent resolves don't clobber each other.
+    tmp = tempname(dirname(lp); cleanup = false)
     try
         Downloads.download(a.url, tmp; timeout)
     catch e
@@ -131,6 +142,21 @@ end
 # Public operations
 # ---------------------------------------------------------------------------
 
+# Remove now-empty cache directories left behind by a removed blob, walking up
+# toward (but never past or including) the cache root.
+function _prune_empty_dirs(dir::AbstractString, root::AbstractString)
+    isempty(root) && return nothing
+    root = normpath(root)
+    sep = Base.Filesystem.path_separator
+    prefix = endswith(root, sep) ? root : root * sep
+    dir = normpath(dir)
+    while dir != root && startswith(dir, prefix) && isdir(dir) && isempty(readdir(dir))
+        rm(dir)
+        dir = dirname(dir)
+    end
+    return nothing
+end
+
 """
     clear_from_cache(b; config=DEFAULT_CONFIG[]) -> Bool
 
@@ -141,15 +167,21 @@ function clear_from_cache(b::AbstractLazyBlob; config::Config = DEFAULT_CONFIG[]
     lp = local_path(config, b)
     isfile(lp) || return false
     rm(lp; force = true)
+    _prune_empty_dirs(dirname(lp), local_cache_dir(config))
     return true
 end
 
-function s3_upload(local_file, bucket, name = nothing; config::Config = DEFAULT_CONFIG[], verbose::Bool = false)
+function s3_upload(
+        local_file::AbstractString, bucket::AbstractString, name::Union{AbstractString, Nothing} = nothing;
+        config::Config = DEFAULT_CONFIG[], verbose::Bool = false
+    )
     validate_s3_config(config)
     isfile(local_file) || error("not a file: $local_file")
     name = isnothing(name) ? basename(local_file) : name
+    # `--` stops rclone flag parsing so a local_file beginning with `-` is
+    # treated as a path, not a flag.
     r = _with_rclone(config) do make_cmd
-        _run(make_cmd(`copyto $local_file $RCLONE_REMOTE:$bucket/$name --s3-no-check-bucket`); verbose)
+        _run(make_cmd(`copyto --s3-no-check-bucket -- $local_file $RCLONE_REMOTE:$bucket/$name`); verbose)
     end
     r.ok || error("upload failed (rclone exit $(r.code)): $(strip(r.err))")
     return LazyS3Blob(; bucket, name)
@@ -161,7 +193,7 @@ end
 List objects in `bucket` (recursively) as `LazyS3Blob` handles. If `regex` is
 given, only objects whose key matches are returned.
 """
-function s3_search(bucket::String, regex::Union{Regex,Nothing} = nothing; config::Config = DEFAULT_CONFIG[], verbose::Bool = false)
+function s3_search(bucket::AbstractString, regex::Union{Regex, Nothing} = nothing; config::Config = DEFAULT_CONFIG[], verbose::Bool = false)
     validate_s3_config(config)
     r = _with_rclone(config) do make_cmd
         _run(make_cmd(`lsf $RCLONE_REMOTE:$bucket --files-only -R`); verbose)
@@ -188,7 +220,10 @@ function _run(cmd::Cmd; verbose::Bool = false)
     verbose && @info "rclone" cmd
     out = IOBuffer()
     err = IOBuffer()
-    proc = run(pipeline(cmd; stdout = out, stderr = err); wait = false)
+    # `run` infers as `Any` through `pipeline`'s kwargs even though a redirected
+    # single command always yields a `Base.Process`; assert it so `proc.exitcode`
+    # et al. stay concrete and don't leak runtime dispatch into callers.
+    proc = run(pipeline(cmd; stdout = out, stderr = err); wait = false)::Base.Process
     wait(proc)
     serr = String(take!(err))
     verbose && !isempty(serr) && @info "rclone stderr" serr
@@ -196,29 +231,34 @@ function _run(cmd::Cmd; verbose::Bool = false)
 end
 
 function _write_rclone_config(io::IO, c::Config)
-    write(io, """
-    [$RCLONE_REMOTE]
-    type = s3
-    provider = AWS
-    access_key_id = $(c.s3_access_key_id)
-    secret_access_key = $(c.s3_secret_access_key)
-    region = $(c.s3_region)
-    location_constraint = $(c.s3_region)
-    """)
+    return write(
+        io, """
+        [$RCLONE_REMOTE]
+        type = s3
+        provider = AWS
+        access_key_id = $(c.s3_access_key_id)
+        secret_access_key = $(c.s3_secret_access_key)
+        region = $(c.s3_region)
+        location_constraint = $(c.s3_region)
+        """
+    )
 end
 
 """
     _with_rclone(f, config) -> f(make_cmd)
 
 Write a temporary rclone config for `config` and call `f` with a closure
-`make_cmd(args::Cmd) -> Cmd` that prepends the rclone binary and appends the
-`--config` flag. The temp config is removed when `f` returns.
+`make_cmd(args::Cmd) -> Cmd` that prepends the rclone binary and the global
+`--config` flag. The flag goes before the subcommand so a `--` flag terminator
+inside `args` doesn't swallow it. The temp config is removed when `f` returns.
 """
 function _with_rclone(f, config::Config)
-    mktemp() do path, io
+    return mktemp() do path, io
         _write_rclone_config(io, config)
         close(io)
-        make_cmd(args::Cmd) = `$(rclone()) $args --config $path`
+        # `rclone()` (a JLL accessor) infers as `Any`; assert its `Cmd` so the
+        # interpolated command builds without runtime dispatch in `cmd_gen`.
+        make_cmd(args::Cmd) = `$(rclone()::Cmd) --config $path $args`
         f(make_cmd)
     end
 end

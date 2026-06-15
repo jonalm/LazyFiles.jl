@@ -42,7 +42,9 @@ csvs  = s3_search("my-bucket", r"\.csv$"; config = cfg)     # filtered by a rege
 clear_from_cache(blob; config = cfg)                        # drop the local copy
 ```
 
-A handle resolves to `nothing` if the object does not exist.
+A handle resolves to `nothing` if the object does not exist; a genuine failure
+(bad credentials, missing bucket, network error) raises rather than silently
+returning `nothing`.
 
 ## HTTP artifacts
 
@@ -56,8 +58,9 @@ path = a(; config = cfg)        # downloads to <cache>/_artifacts_/data.bin, or 
 
 ## Notes
 
-- Downloads are written to a `.partial` file and renamed on success, so an
-  interrupted run never leaves a truncated file in the cache.
+- Downloads are written to a unique temporary file in the cache and renamed on
+  success, so an interrupted run never leaves a truncated file in the cache and
+  concurrent resolves of the same handle don't clobber each other.
 - The rclone S3 backend is provided by `Rclone_jll` — no system install needed.
 
 ## Tests

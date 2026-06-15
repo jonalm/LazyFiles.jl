@@ -24,8 +24,10 @@ if isfile(ENVFILE)
 end
 get!(ENV, "AWS_REGION", "eu-north-1")
 
-const BUCKET = get(ENV, "LAZYFILES_TEST_BUCKET",
-                   "lazyfiles-testbucket-319898207248-eu-north-1-an")
+const BUCKET = get(
+    ENV, "LAZYFILES_TEST_BUCKET",
+    "lazyfiles-testbucket-319898207248-eu-north-1-an"
+)
 const CACHE = mktempdir()
 const CFG = config_from_env(; local_cache_dir = CACHE)
 const RID = string(getpid(), "-", time_ns())
@@ -37,16 +39,27 @@ end
 
 # Test-side helper: presigned HTTP URL for an S3 object (drives LazyArtifact
 # tests with content we control, rather than a flaky third-party URL).
-presign(b) = String(strip(LazyFiles._with_rclone(CFG) do mk
-    LazyFiles._run(mk(`link $(LazyFiles.RCLONE_REMOTE):$(b.bucket)/$(b.name)`))
-end.out))
+presign(b) = String(
+    strip(
+        LazyFiles._with_rclone(CFG) do mk
+            LazyFiles._run(mk(`link $(LazyFiles.RCLONE_REMOTE):$(b.bucket)/$(b.name)`))
+        end.out
+    )
+)
 
 # Best-effort teardown so re-runs stay idempotent and the bucket stays clean.
 function cleanup(blobs...)
     for b in blobs
-        try; delete_remote(b); catch; end
-        try; clear_from_cache(b; config = CFG); catch; end
+        try
+            delete_remote(b)
+        catch
+        end
+        try
+            clear_from_cache(b; config = CFG)
+        catch
+        end
     end
+    return
 end
 
 @testset "LazyFiles" begin
@@ -56,8 +69,11 @@ end
         @test_throws ErrorException LazyFiles.validate_s3_config(Config())
         @test_throws ErrorException LazyFiles.validate_s3_config(Config(local_cache_dir = "/tmp"))
         @test LazyFiles.validate_s3_config(
-            Config(local_cache_dir = "/tmp", s3_access_key_id = "a",
-                   s3_secret_access_key = "b", s3_region = "r")) == true
+            Config(
+                local_cache_dir = "/tmp", s3_access_key_id = "a",
+                s3_secret_access_key = "b", s3_region = "r"
+            )
+        ) == true
     end
 
     @testset "operations enforce config (offline)" begin
@@ -68,8 +84,10 @@ end
         @test_throws ErrorException LazyS3Blob(bucket = "b", name = "n")(; config = nocreds)
 
         # a blob name must not escape the cache directory
-        okcreds = Config(local_cache_dir = mktempdir(), s3_access_key_id = "a",
-                         s3_secret_access_key = "b", s3_region = "r")
+        okcreds = Config(
+            local_cache_dir = mktempdir(), s3_access_key_id = "a",
+            s3_secret_access_key = "b", s3_region = "r"
+        )
         @test_throws ErrorException LazyS3Blob(bucket = "b", name = "../../escape")(; config = okcreds)
 
         # LazyArtifact needs a cache dir but no S3 credentials
@@ -263,3 +281,6 @@ end
         end
     end
 end
+
+# Type-stability checks (offline, always run). Kept in a separate script.
+include("jet_test.jl")
