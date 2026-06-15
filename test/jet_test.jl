@@ -16,7 +16,7 @@
 using Test
 using JET
 import LazyFiles
-using LazyFiles: Config, LazyS3Blob, LazyArtifact, s3_upload, s3_search,
+using LazyFiles: Config, LazyS3Blob, LazyArtifact, s3_upload, s3_list, s3_list_with_stats,
     clear_from_cache, config_from_env, validate_s3_config, default_config!
 
 # Restrict reports to instabilities originating in LazyFiles itself.
@@ -53,10 +53,12 @@ const JART  = LazyArtifact(url = "http://example.invalid/x.bin", name = "x.bin")
     @testset "public operations" begin
         @test_opt target_modules = TM s3_upload("/tmp/f", "bucket", "name")
         @test_opt target_modules = TM s3_upload("/tmp/f", "bucket")          # name defaulted
-        @test_opt target_modules = TM s3_search("bucket")                    # no regex
-        @test_opt target_modules = TM s3_search("bucket", r"\.txt$")         # with regex
-        @test_opt target_modules = TM s3_search("bucket"; prefix = "a/b")    # server-side prefix
-        @test_opt target_modules = TM s3_search("bucket", r"\.txt$"; prefix = "a/b")
+        @test_opt target_modules = TM s3_list("bucket")                      # no regex
+        @test_opt target_modules = TM s3_list("bucket", r"\.txt$")           # with regex
+        @test_opt target_modules = TM s3_list("bucket"; prefix = "a/b")      # server-side prefix
+        @test_opt target_modules = TM s3_list("bucket", r"\.txt$"; prefix = "a/b")
+        @test_opt target_modules = TM s3_list_with_stats("bucket")
+        @test_opt target_modules = TM s3_list_with_stats("bucket", r"\.txt$"; prefix = "a/b")
         @test_opt target_modules = TM clear_from_cache(JBLOB; config = JCFG)
         @test_opt target_modules = TM clear_from_cache(JART; config = JCFG)
     end
@@ -64,6 +66,7 @@ const JART  = LazyArtifact(url = "http://example.invalid/x.bin", name = "x.bin")
     @testset "rclone backend internals" begin
         @test_opt target_modules = TM LazyFiles._run(`true`)
         @test_opt target_modules = TM LazyFiles._write_rclone_config(IOBuffer(), JCFG)
-        @test_opt target_modules = TM LazyFiles._parse_lsf("a\nb/c\n")
+        @test_opt target_modules = TM LazyFiles._parse_modtime("2024-01-02T12:00:00.0Z")
+        @test_opt target_modules = TM LazyFiles._parse_lsjson("[]", "bucket", "", nothing)
     end
 end

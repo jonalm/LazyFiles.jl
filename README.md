@@ -12,7 +12,7 @@ All operations take a `Config` (or use a process-wide default):
 
 ```julia
 using LazyFiles
-using LazyFiles: Config, LazyS3Blob, LazyArtifact, s3_upload, s3_search, clear_from_cache
+using LazyFiles: Config, LazyS3Blob, LazyArtifact, s3_upload, s3_list, s3_list_with_stats, clear_from_cache
 
 cfg = Config(
     local_cache_dir      = expanduser("~/.cache/lazyfiles"),
@@ -38,9 +38,14 @@ blob = s3_upload("report.csv", "my-bucket"; config = cfg)   # -> LazyS3Blob; nam
 path = blob(; config = cfg)                                 # downloads on first call, returns local path
 path = blob(; config = cfg)                                 # cache hit: returns immediately, no network
 
-blobs = s3_search("my-bucket"; config = cfg)                # Vector{LazyS3Blob}, every object (recursive)
-csvs  = s3_search("my-bucket", r"\.csv$"; config = cfg)     # filtered by a regex on the key
-logs  = s3_search("my-bucket"; prefix = "logs/2024", config = cfg)  # server-side: only keys under logs/2024/
+blobs = s3_list("my-bucket"; config = cfg)                  # Vector{LazyS3Blob}, every object (recursive)
+csvs  = s3_list("my-bucket", r"\.csv$"; config = cfg)       # filtered by a regex on the key
+logs  = s3_list("my-bucket"; prefix = "logs/2024", config = cfg)  # server-side: only keys under logs/2024/
+
+# Same listing, with each object's size (bytes) and last-modified time:
+stats = s3_list_with_stats("my-bucket"; prefix = "logs/2024", config = cfg)
+# -> Vector{@NamedTuple{blob::LazyS3Blob, size::Int, modified::DateTime}}
+latest = argmax(e -> e.modified, stats).blob                # e.g. pick the newest object
 
 clear_from_cache(blob; config = cfg)                        # drop the local copy
 ```

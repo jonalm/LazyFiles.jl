@@ -1,10 +1,13 @@
 module LazyFiles
 
+using Dates
 using Downloads
+using JSON
 using Rclone_jll
 
-public Config, LazyS3Blob, LazyArtifact, s3_upload, s3_search, clear_from_cache,
-    validate_s3_config, validate_minimal_config, default_config!, config_from_env
+public Config, LazyS3Blob, LazyArtifact, s3_upload, s3_list, s3_list_with_stats,
+    clear_from_cache, validate_s3_config, validate_minimal_config, default_config!,
+    config_from_env
 
 # ---------------------------------------------------------------------------
 # Config
@@ -250,43 +253,88 @@ function s3_upload(
     return LazyS3Blob(; bucket, name)
 end
 
-# Parse rclone `lsf` output into keys: one per line. Drop only the line
-# terminator (a stray `\r`) — never surrounding spaces, which are legitimate (if
-# non-portable) parts of an S3 key, so trimming them would resolve a *different*
-# object. A key containing a newline can't be represented in this line-based
-# listing; switch to `lsjson` if that ever matters.
-_parse_lsf(out::AbstractString) =
-    String[String(s) for s in (rstrip(l, '\r') for l in split(out, '\n')) if !isempty(s)]
+# The rclone `lsjson` fields we use. JSON's typed parse fills these by name and
+# ignores the rest (Name, IsDir, …); field names match rclone's JSON keys, which
+# is why they're capitalized rather than Julia-style.
+struct _LsObject
+    Path::String
+    Size::Int
+    ModTime::String
+end
+
+# rclone `lsjson` emits an RFC3339 ModTime (e.g. "2024-01-02T12:00:00.123456789Z").
+# Its first 19 characters are always `yyyy-mm-ddTHH:MM:SS`, so truncate to whole
+# seconds and read as a naive `DateTime`. We pass `--use-server-modtime`, so the
+# value is the S3 last-modified time (UTC); the sub-second part and zone suffix
+# are dropped — second resolution is enough to order and poll listings.
+_parse_modtime(s::AbstractString) = DateTime(first(s, 19), dateformat"yyyy-mm-ddTHH:MM:SS")
+
+# Turn an `lsjson` listing into (blob, size, modified) records. Factored out of
+# `s3_list_with_stats` so it is unit-testable without rclone. `lsjson -R` reports
+# keys relative to the listed dir, so re-prepend `pfx` to rebuild the full key
+# each LazyS3Blob needs; `regex`, when given, matches against that full key.
+function _parse_lsjson(
+        out::AbstractString, bucket::AbstractString, pfx::AbstractString, regex::Union{Regex, Nothing}
+    )
+    recs = @NamedTuple{blob::LazyS3Blob, size::Int, modified::DateTime}[]
+    isempty(strip(out)) && return recs
+    for o in JSON.parse(out, Vector{_LsObject})::Vector{_LsObject}
+        name = isempty(pfx) ? o.Path : string(pfx, '/', o.Path)
+        isnothing(regex) || occursin(regex, name) || continue
+        push!(
+            recs, (;
+                blob = LazyS3Blob(; bucket, name),
+                size = o.Size,
+                modified = _parse_modtime(o.ModTime),
+            )
+        )
+    end
+    return recs
+end
 
 """
-    s3_search(bucket, regex=nothing; prefix="", config=DEFAULT_CONFIG[]) -> Vector{LazyS3Blob}
+    s3_list_with_stats(bucket, regex=nothing; prefix="", config=DEFAULT_CONFIG[])
+        -> Vector{@NamedTuple{blob::LazyS3Blob, size::Int, modified::DateTime}}
 
-List objects in `bucket` (recursively) as `LazyS3Blob` handles.
+List objects in `bucket` (recursively) together with each object's `size` (bytes)
+and `modified` time (the S3 last-modified timestamp, UTC, second resolution).
 
-`prefix` narrows the listing *on the server* to keys under that `/`-delimited
-key prefix (e.g. `"logs/2024"`), so only that subtree is fetched instead of the
-whole bucket — the one filter S3 itself can apply. A prefix matching nothing
-yields an empty vector. If `regex` is also given, the (already narrowed) keys
-are filtered client-side, matched against the full key.
+`prefix` and `regex` filter exactly as in [`s3_list`](@ref): `prefix` narrows the
+listing on the server, `regex` filters the returned keys client-side against the
+full key. This is the underlying listing primitive; [`s3_list`](@ref) is this call
+projected down to just the `blob` handles.
 """
-function s3_search(
+function s3_list_with_stats(
         bucket::AbstractString, regex::Union{Regex, Nothing} = nothing;
         prefix::AbstractString = "", config::Config = DEFAULT_CONFIG[], verbose::Bool = false
     )
     validate_s3_config(config)
-    # rclone lists the "directory" `bucket/pfx` and returns keys relative to it,
-    # so re-prepend `pfx` to rebuild the full key each LazyS3Blob needs to resolve.
+    # rclone lists the "directory" `bucket/pfx`; the keys come back relative to it.
     pfx = strip(prefix, '/')
     remote = isempty(pfx) ? "$RCLONE_REMOTE:$bucket" : "$RCLONE_REMOTE:$bucket/$pfx"
     r = _with_rclone(config) do make_cmd
-        _run(make_cmd(`lsf $remote --files-only -R`); verbose)
+        _run(make_cmd(`lsjson $remote --files-only -R --use-server-modtime`); verbose)
     end
-    r.ok || error("search failed (rclone exit $(r.code)): $(strip(r.err))")
-    names = _parse_lsf(r.out)
-    isempty(pfx) || (names = [string(pfx, '/', n) for n in names])
-    isnothing(regex) || filter!(n -> occursin(regex, n), names)
-    return [LazyS3Blob(; bucket, name) for name in names]
+    r.ok || error("list failed (rclone exit $(r.code)): $(strip(r.err))")
+    return _parse_lsjson(r.out, bucket, pfx, regex)
 end
+
+"""
+    s3_list(bucket, regex=nothing; prefix="", config=DEFAULT_CONFIG[]) -> Vector{LazyS3Blob}
+
+List objects in `bucket` (recursively) as `LazyS3Blob` handles.
+
+`prefix` narrows the listing *on the server* to keys under that `/`-delimited key
+prefix (e.g. `"logs/2024"`), so only that subtree is fetched instead of the whole
+bucket — the one filter S3 itself can apply. A prefix matching nothing yields an
+empty vector. If `regex` is also given, the (already narrowed) keys are filtered
+client-side, matched against the full key.
+
+Use [`s3_list_with_stats`](@ref) when you also need each object's size and
+last-modified time.
+"""
+s3_list(bucket::AbstractString, regex::Union{Regex, Nothing} = nothing; kwargs...) =
+    [e.blob for e in s3_list_with_stats(bucket, regex; kwargs...)]
 
 # ---------------------------------------------------------------------------
 # rclone backend
