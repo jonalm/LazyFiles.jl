@@ -170,8 +170,8 @@ end
         {"Path":"b/c d.bin","Name":"c d.bin","Size":10,"ModTime":"2024-03-04T05:06:07.123456789+00:00","IsDir":false}
         ]
         """
-        recs = LazyFiles._parse_lsjson(out, "bucket", "", nothing)
-        @test recs isa Vector{@NamedTuple{blob::LazyS3Blob, size::Int, modified::DateTime}}
+        recs = LazyFiles._parse_lsjson(out, "bucket", "")
+        @test recs isa Vector{LazyFiles.S3Entry}
         @test [r.blob.name for r in recs] == ["a.txt", "b/c d.bin"]   # spaces preserved
         @test all(r -> r.blob.bucket == "bucket", recs)
         @test [r.size for r in recs] == [3, 10]
@@ -179,14 +179,15 @@ end
         @test recs[2].modified == DateTime(2024, 3, 4, 5, 6, 7)
 
         # a prefix is re-prepended to rebuild the full key
-        pre = LazyFiles._parse_lsjson(out, "bucket", "logs/2024", nothing)
+        pre = LazyFiles._parse_lsjson(out, "bucket", "logs/2024")
         @test [r.blob.name for r in pre] == ["logs/2024/a.txt", "logs/2024/b/c d.bin"]
-        # regex filters on the full key
-        txt = LazyFiles._parse_lsjson(out, "bucket", "", r"\.txt$")
-        @test [r.blob.name for r in txt] == ["a.txt"]
+        # a listing predicate sees the full `S3Entry`: a `Regex` selects on the full
+        # key (`blob.name`), a function can select on size (or modified) as well
+        @test [r.blob.name for r in filter(e -> occursin(r"\.txt$", e.blob.name), recs)] == ["a.txt"]
+        @test [r.blob.name for r in filter(e -> e.size > 5, recs)] == ["b/c d.bin"]
         # an empty listing is an empty vector, not an error
-        @test isempty(LazyFiles._parse_lsjson("[]", "bucket", "", nothing))
-        @test isempty(LazyFiles._parse_lsjson("", "bucket", "", nothing))
+        @test isempty(LazyFiles._parse_lsjson("[]", "bucket", ""))
+        @test isempty(LazyFiles._parse_lsjson("", "bucket", ""))
     end
 
     if !LazyFiles.is_valid_s3_config(CFG)
@@ -254,7 +255,7 @@ end
             @test blob(; config = CFG) === nothing
         end
 
-        @testset "s3_list lists blobs and filters by regex" begin
+        @testset "s3_list lists blobs and filters by regex or predicate" begin
             pre = "search-$RID"
             n1 = "$pre/alpha.txt"; n2 = "$pre/beta.log"
             f1 = tempname(); write(f1, "A"); f2 = tempname(); write(f2, "B")
@@ -266,8 +267,12 @@ end
                 names = Set(b.name for b in found)
                 @test n1 in names
                 @test n2 in names
-                txt = s3_list(BUCKET, Regex(pre * raw".*\.txt"); config = CFG)
+                # Regex shorthand: matches the full key
+                txt = s3_list(Regex(pre * raw".*\.txt"), BUCKET; config = CFG)
                 @test Set(b.name for b in txt) == Set([n1])
+                # function predicate: selects on the whole record (here, by name)
+                alpha = s3_list(e -> endswith(e.blob.name, "alpha.txt"), BUCKET; config = CFG)
+                @test Set(b.name for b in alpha) == Set([n1])
             finally
                 cleanup(b1, b2)
             end
@@ -288,6 +293,9 @@ end
                 @test r.size == sizeof(body)
                 @test r.modified isa DateTime
                 @test read(r.blob(; config = CFG), String) == body   # the handle resolves
+                # a predicate filters on the record (here, by size)
+                @test length(s3_list_with_stats(e -> e.size >= sizeof(body), BUCKET; prefix = pre, config = CFG)) == 1
+                @test isempty(s3_list_with_stats(e -> e.size > sizeof(body), BUCKET; prefix = pre, config = CFG))
             finally
                 cleanup(b)
             end
@@ -309,7 +317,7 @@ end
                 # a prefix matching nothing is an empty vector, not an error
                 @test isempty(s3_list(BUCKET; prefix = "$pre/zzz", config = CFG))
                 # prefix and regex compose; the regex matches against the full key
-                one = s3_list(BUCKET, Regex("one\\.txt"); prefix = "$pre/x", config = CFG)
+                one = s3_list(Regex("one\\.txt"), BUCKET; prefix = "$pre/x", config = CFG)
                 @test Set(b.name for b in one) == Set([n1])
             finally
                 cleanup(b1, b2, b3)
@@ -330,7 +338,7 @@ end
         end
 
         @testset "s3_list with a non-matching regex returns an empty vector" begin
-            res = s3_list(BUCKET, Regex("no-such-key-zzz-$RID"); config = CFG)
+            res = s3_list(Regex("no-such-key-zzz-$RID"), BUCKET; config = CFG)
             @test res isa Vector{LazyS3Blob}
             @test isempty(res)
         end

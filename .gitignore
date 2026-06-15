@@ -17,6 +17,9 @@ deps/usr/
 deps/src/
 LocalPreferences.toml
 
+# Agent / local
+CLAUDE.md
+
 # Editor / OS
 .vscode/
 .idea/
