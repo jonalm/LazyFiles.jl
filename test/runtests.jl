@@ -93,6 +93,10 @@ end
                 s3_secret_access_key = "b", s3_region = "r"
             )
         ) == true
+
+        # validate_minimal_config: only local_cache_dir matters (no S3 creds needed)
+        @test_throws ErrorException LazyFiles.validate_minimal_config(Config())
+        @test LazyFiles.validate_minimal_config(Config(local_cache_dir = "/tmp")) == true
     end
 
     @testset "operations enforce config (offline)" begin

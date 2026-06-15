@@ -77,7 +77,10 @@ end
 is_valid_minimal_config(c::Config) = !isempty(c.local_cache_dir)
 is_valid_s3_config(c::Config) = is_valid_minimal_config(c) &&
     !isempty(c.s3_access_key_id) && !isempty(c.s3_secret_access_key) && !isempty(c.s3_region)
+
 validate_s3_config(c::Config) = is_valid_s3_config(c) || error("S3 config is not properly set")
+validate_minimal_config(c::Config) = is_valid_minimal_config(c) || error("local_cache_dir is not set")
+
 
 const DEFAULT_CONFIG = Ref{Config}(Config())
 default_config!(c::Config) = (DEFAULT_CONFIG[] = c)
@@ -159,7 +162,7 @@ end
 local_path(config::Config, a::LazyArtifact) = _checked_path(local_cache_dir(config), "_artifacts_", a.name)
 
 function (a::LazyArtifact)(; config::Config = DEFAULT_CONFIG[], verbose::Bool = false, timeout::Real = ARTIFACT_TIMEOUT)
-    is_valid_minimal_config(config) || error("local_cache_dir is not set")
+    validate_minimal_config(config)
     lp = local_path(config, a)
     isfile(lp) && return lp
     mkpath(dirname(lp))
@@ -219,7 +222,7 @@ Remove the local cached copy of `b`, if present. Returns `true` if a file was
 removed, `false` if there was nothing cached.
 """
 function clear_from_cache(b::AbstractLazyBlob; config::Config = DEFAULT_CONFIG[])
-    is_valid_minimal_config(config) || error("local_cache_dir is not set")
+    validate_minimal_config(config)
     lp = local_path(config, b)
     isfile(lp) || return false
     rm(lp; force = true)
