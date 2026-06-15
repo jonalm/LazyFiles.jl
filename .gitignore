@@ -1,0 +1,24 @@
+# Secrets / environment
+env
+.env
+*.env
+
+# Julia
+/Manifest.toml
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+/docs/build/
+/docs/site/
+deps/deps.jl
+deps/build.log
+deps/downloads/
+deps/usr/
+deps/src/
+LocalPreferences.toml
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
