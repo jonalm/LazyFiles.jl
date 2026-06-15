@@ -1,8 +1,9 @@
 using Test
 import Downloads
 using Sockets
+using Dates: DateTime
 import LazyFiles
-using LazyFiles: Config, LazyS3Blob, LazyArtifact, s3_upload, s3_search, clear_from_cache, config_from_env
+using LazyFiles: Config, LazyS3Blob, LazyArtifact, s3_upload, s3_list, s3_list_with_stats, clear_from_cache, config_from_env
 
 # ---------------------------------------------------------------------------
 # Test setup
@@ -103,7 +104,8 @@ end
         nocreds = Config(local_cache_dir = mktempdir())   # cache set, but no S3 creds
         f = tempname(); write(f, "x")
         @test_throws ErrorException s3_upload(f, "bucket"; config = nocreds)
-        @test_throws ErrorException s3_search("bucket"; config = nocreds)
+        @test_throws ErrorException s3_list("bucket"; config = nocreds)
+        @test_throws ErrorException s3_list_with_stats("bucket"; config = nocreds)
         @test_throws ErrorException LazyS3Blob(bucket = "b", name = "n")(; config = nocreds)
 
         # a blob name must not escape the cache directory
@@ -158,17 +160,33 @@ end
         @test_throws ErrorException s3_upload(f, "a\\b", "k"; config = cfg)
     end
 
-    @testset "lsf parsing keeps significant whitespace (offline)" begin
-        # CRLF terminators dropped and the trailing empty line ignored, but spaces
-        # that are part of a key are preserved — trimming would resolve a *different*
-        # object. (Leading/trailing-space keys are non-portable and refused at
-        # resolve; preserving them here means that refusal is honest, not a key the
-        # listing silently rewrote.)
-        out = "a.txt\r\nb/c.bin\r\n leading.txt\r\ntrailing .txt\r\n"
-        @test LazyFiles._parse_lsf(out) == ["a.txt", "b/c.bin", " leading.txt", "trailing .txt"]
-        @test LazyFiles._parse_lsf("") == String[]
-        @test LazyFiles._parse_lsf("only\n") == ["only"]
-        @test LazyFiles._parse_lsf("no-terminator") == ["no-terminator"]
+    @testset "lsjson parsing (offline)" begin
+        # rclone lsjson: keys relative to the listed dir, plus size and RFC3339
+        # ModTime. JSON keeps spaces in keys intact (line-based parsing couldn't),
+        # and ModTime is truncated to whole seconds.
+        out = """
+        [
+        {"Path":"a.txt","Name":"a.txt","Size":3,"ModTime":"2024-01-02T12:00:00.000000000Z","IsDir":false},
+        {"Path":"b/c d.bin","Name":"c d.bin","Size":10,"ModTime":"2024-03-04T05:06:07.123456789+00:00","IsDir":false}
+        ]
+        """
+        recs = LazyFiles._parse_lsjson(out, "bucket", "", nothing)
+        @test recs isa Vector{@NamedTuple{blob::LazyS3Blob, size::Int, modified::DateTime}}
+        @test [r.blob.name for r in recs] == ["a.txt", "b/c d.bin"]   # spaces preserved
+        @test all(r -> r.blob.bucket == "bucket", recs)
+        @test [r.size for r in recs] == [3, 10]
+        @test recs[1].modified == DateTime(2024, 1, 2, 12, 0, 0)      # truncated to seconds
+        @test recs[2].modified == DateTime(2024, 3, 4, 5, 6, 7)
+
+        # a prefix is re-prepended to rebuild the full key
+        pre = LazyFiles._parse_lsjson(out, "bucket", "logs/2024", nothing)
+        @test [r.blob.name for r in pre] == ["logs/2024/a.txt", "logs/2024/b/c d.bin"]
+        # regex filters on the full key
+        txt = LazyFiles._parse_lsjson(out, "bucket", "", r"\.txt$")
+        @test [r.blob.name for r in txt] == ["a.txt"]
+        # an empty listing is an empty vector, not an error
+        @test isempty(LazyFiles._parse_lsjson("[]", "bucket", "", nothing))
+        @test isempty(LazyFiles._parse_lsjson("", "bucket", "", nothing))
     end
 
     if !LazyFiles.is_valid_s3_config(CFG)
@@ -236,26 +254,46 @@ end
             @test blob(; config = CFG) === nothing
         end
 
-        @testset "s3_search lists blobs and filters by regex" begin
+        @testset "s3_list lists blobs and filters by regex" begin
             pre = "search-$RID"
             n1 = "$pre/alpha.txt"; n2 = "$pre/beta.log"
             f1 = tempname(); write(f1, "A"); f2 = tempname(); write(f2, "B")
             b1 = s3_upload(f1, BUCKET, n1; config = CFG)
             b2 = s3_upload(f2, BUCKET, n2; config = CFG)
             try
-                found = s3_search(BUCKET; config = CFG)
+                found = s3_list(BUCKET; config = CFG)
                 @test found isa Vector{LazyS3Blob}
                 names = Set(b.name for b in found)
                 @test n1 in names
                 @test n2 in names
-                txt = s3_search(BUCKET, Regex(pre * raw".*\.txt"); config = CFG)
+                txt = s3_list(BUCKET, Regex(pre * raw".*\.txt"); config = CFG)
                 @test Set(b.name for b in txt) == Set([n1])
             finally
                 cleanup(b1, b2)
             end
         end
 
-        @testset "s3_search narrows by server-side prefix" begin
+        @testset "s3_list_with_stats returns size and modtime" begin
+            pre = "stats-$RID"
+            nm = "$pre/payload.txt"
+            body = "0123456789"
+            f = tempname(); write(f, body)
+            b = s3_upload(f, BUCKET, nm; config = CFG)
+            try
+                recs = s3_list_with_stats(BUCKET; prefix = pre, config = CFG)
+                @test recs isa Vector{@NamedTuple{blob::LazyS3Blob, size::Int, modified::DateTime}}
+                @test length(recs) == 1
+                r = only(recs)
+                @test r.blob.name == nm
+                @test r.size == sizeof(body)
+                @test r.modified isa DateTime
+                @test read(r.blob(; config = CFG), String) == body   # the handle resolves
+            finally
+                cleanup(b)
+            end
+        end
+
+        @testset "s3_list narrows by server-side prefix" begin
             pre = "prefix-$RID"
             n1 = "$pre/x/one.txt"; n2 = "$pre/x/two.txt"; n3 = "$pre/y/three.txt"
             f = tempname(); write(f, "p")
@@ -263,15 +301,15 @@ end
             b2 = s3_upload(f, BUCKET, n2; config = CFG)
             b3 = s3_upload(f, BUCKET, n3; config = CFG)
             try
-                under_x = s3_search(BUCKET; prefix = "$pre/x", config = CFG)
+                under_x = s3_list(BUCKET; prefix = "$pre/x", config = CFG)
                 # full keys are reconstructed (not relative to the prefix); y/ excluded
                 @test Set(b.name for b in under_x) == Set([n1, n2])
                 # a reconstructed blob actually resolves, proving the key is the full key
                 @test read(first(under_x)(; config = CFG), String) == "p"
                 # a prefix matching nothing is an empty vector, not an error
-                @test isempty(s3_search(BUCKET; prefix = "$pre/zzz", config = CFG))
+                @test isempty(s3_list(BUCKET; prefix = "$pre/zzz", config = CFG))
                 # prefix and regex compose; the regex matches against the full key
-                one = s3_search(BUCKET, Regex("one\\.txt"); prefix = "$pre/x", config = CFG)
+                one = s3_list(BUCKET, Regex("one\\.txt"); prefix = "$pre/x", config = CFG)
                 @test Set(b.name for b in one) == Set([n1])
             finally
                 cleanup(b1, b2, b3)
@@ -291,8 +329,8 @@ end
             end
         end
 
-        @testset "s3_search with a non-matching regex returns an empty vector" begin
-            res = s3_search(BUCKET, Regex("no-such-key-zzz-$RID"); config = CFG)
+        @testset "s3_list with a non-matching regex returns an empty vector" begin
+            res = s3_list(BUCKET, Regex("no-such-key-zzz-$RID"); config = CFG)
             @test res isa Vector{LazyS3Blob}
             @test isempty(res)
         end
