@@ -5,27 +5,120 @@ using Downloads
 using JSON
 using Rclone_jll
 
-public Config, LazyS3Blob, LazyArtifact, S3Entry, s3_upload, s3_list, s3_list_with_stats,
-    clear_from_cache, validate_s3_config, validate_minimal_config, default_config!,
-    config_from_env
+public S3Config, NoConfig, LazyS3Blob, LazyArtifact, S3Entry,
+    cache_dir, cache_dir!,
+    s3_upload, s3_list, s3_list_with_stats,
+    clear_from_cache, validate_s3_config, default_config!, default_config, config_from_env,
+    # Extension interface for custom lazy blobs (see the README "Extending" section).
+    AbstractLazyBlob, resolve, fetch!, cache_subpath, config_type, validate_config, local_path
 
 # ---------------------------------------------------------------------------
-# Config
+# Cache root
+#
+# The cache directory is the one thing *every* blob needs, independent of how it
+# is fetched, so it is framework state — a process-wide setting — rather than a
+# field of any per-backend config. Set it once with `cache_dir!`, or via the
+# `LAZYFILES_CACHE_DIR` environment variable, or override per call with the
+# `cache_dir` keyword; with none of those set it defaults to `DEFAULT_CACHE_DIR`.
 # ---------------------------------------------------------------------------
 
-Base.@kwdef struct Config
-    local_cache_dir::String = ""
+const CACHE_DIR = Ref{String}("")
 
-    # S3 only
-    s3_access_key_id::String = ""
-    s3_secret_access_key::String = ""
-    s3_region::String = ""
+# Fallback cache root when neither `cache_dir!` nor `LAZYFILES_CACHE_DIR` is set.
+const DEFAULT_CACHE_DIR = joinpath(homedir(), ".LazyFiles.jl_cache")
+
+"""
+    cache_dir() -> String
+
+The process-wide cache root every blob resolves under, in precedence order: the
+path set with [`cache_dir!`](@ref), else the `LAZYFILES_CACHE_DIR` environment
+variable, else the default `~/.LazyFiles.jl_cache`. Never empty; the directory is
+created on first use.
+"""
+function cache_dir()
+    isempty(CACHE_DIR[]) || return CACHE_DIR[]
+    env = get(ENV, "LAZYFILES_CACHE_DIR", "")
+    return isempty(env) ? DEFAULT_CACHE_DIR : env
 end
 
-local_cache_dir(c::Config) = c.local_cache_dir
+"""
+    cache_dir!(path)
+
+Set the process-wide cache root (see [`cache_dir`](@ref)), taking precedence over
+both the `LAZYFILES_CACHE_DIR` environment variable and the default.
+"""
+cache_dir!(path::AbstractString) = (CACHE_DIR[] = String(path))
 
 # Maximum seconds a single artifact download may take (rclone has its own timeouts).
 const ARTIFACT_TIMEOUT = 300
+
+# ---------------------------------------------------------------------------
+# Fetch configs
+#
+# A "config" carries only what a particular backend needs to *fetch* — never the
+# cache dir. Most blobs need nothing (`NoConfig`); the S3 backend needs
+# credentials (`S3Config`). A blob declares its config type via `config_type`.
+# ---------------------------------------------------------------------------
+
+"""
+    NoConfig()
+
+The fetch config for blobs that need none (e.g. [`LazyArtifact`](@ref)). The
+default [`config_type`](@ref) of every blob.
+"""
+struct NoConfig end
+
+"""
+    S3Config(; access_key_id, secret_access_key, region)
+
+Credentials for the S3 backend ([`LazyS3Blob`](@ref) and the `s3_*` operations).
+Carries no cache dir — that is framework state, see [`cache_dir!`](@ref).
+"""
+Base.@kwdef struct S3Config
+    access_key_id::String = ""
+    secret_access_key::String = ""
+    region::String = ""
+end
+
+is_valid_s3_config(c::S3Config) =
+    !isempty(c.access_key_id) && !isempty(c.secret_access_key) && !isempty(c.region)
+
+validate_s3_config(c::S3Config) = is_valid_s3_config(c) || error("S3 config is not properly set")
+
+# Process-wide default per config type; a config type's owner adds a method.
+const DEFAULT_S3_CONFIG = Ref{S3Config}(S3Config())
+
+"""
+    default_config(::Type{C}) -> C
+
+The process-wide default config of type `C`, used when a blob is resolved without
+an explicit `config` (see [`config_type`](@ref)). `NoConfig` needs no setup;
+`S3Config` returns the one set by [`default_config!`](@ref); a package introducing
+its own config type adds a method here.
+"""
+default_config(::Type{NoConfig}) = NoConfig()
+default_config(::Type{S3Config}) = DEFAULT_S3_CONFIG[]
+
+"""
+    default_config!(c::S3Config)
+
+Set the process-wide default `S3Config` used by the `s3_*` operations and by
+`LazyS3Blob` resolution when no `config` is passed.
+"""
+default_config!(c::S3Config) = (DEFAULT_S3_CONFIG[] = c)
+
+"""
+    config_from_env() -> S3Config
+
+Build an `S3Config` from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and
+`AWS_REGION`. The cache root is separate framework state — set it with
+[`cache_dir!`](@ref) or the `LAZYFILES_CACHE_DIR` environment variable.
+"""
+config_from_env() = S3Config(
+    access_key_id = get(ENV, "AWS_ACCESS_KEY_ID", ""),
+    secret_access_key = get(ENV, "AWS_SECRET_ACCESS_KEY", ""),
+    region = get(ENV, "AWS_REGION", ""),
+)
 
 # DOS device names reserved by Windows; illegal as a path component (with or
 # without an extension) even though they are valid S3 keys / POSIX filenames.
@@ -77,118 +170,187 @@ function _checked_path(base::AbstractString, parts...)
     return full
 end
 
-is_valid_minimal_config(c::Config) = !isempty(c.local_cache_dir)
-is_valid_s3_config(c::Config) = is_valid_minimal_config(c) &&
-    !isempty(c.s3_access_key_id) && !isempty(c.s3_secret_access_key) && !isempty(c.s3_region)
-
-validate_s3_config(c::Config) = is_valid_s3_config(c) || error("S3 config is not properly set")
-validate_minimal_config(c::Config) = is_valid_minimal_config(c) || error("local_cache_dir is not set")
-
-
-const DEFAULT_CONFIG = Ref{Config}(Config())
-default_config!(c::Config) = (DEFAULT_CONFIG[] = c)
-
-"""
-    config_from_env(; local_cache_dir) -> Config
-
-Build a `Config` from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and
-`AWS_REGION` environment variables.
-"""
-config_from_env(; local_cache_dir::String = get(ENV, "LAZYFILES_CACHE_DIR", "")) = Config(;
-    local_cache_dir,
-    s3_access_key_id = get(ENV, "AWS_ACCESS_KEY_ID", ""),
-    s3_secret_access_key = get(ENV, "AWS_SECRET_ACCESS_KEY", ""),
-    s3_region = get(ENV, "AWS_REGION", ""),
-)
-
 # ---------------------------------------------------------------------------
 # Lazy blobs
+#
+# A lazy blob is a handle that resolves to a local path, downloading into the
+# cache on a miss and serving from cache thereafter. The resolve algorithm
+# (check cache -> fetch to a temp -> atomically rename in) is identical for every
+# blob type; a concrete type supplies only the two things that differ:
+#
+#   cache_subpath(b)                 -> the path components under the cache dir
+#   fetch!(b, dest; config, verbose) -> write `dest`, or leave it absent if the
+#                                       resource genuinely does not exist
+#
+# and, optionally, `config_type(b)` (the fetch config it needs; default none) and
+# `validate_config(config, b)`. Implement those and `b()`, `resolve(b)`,
+# `local_path(b)` and `clear_from_cache(b)` all work — see the "Extending"
+# section of the README.
 # ---------------------------------------------------------------------------
 
 abstract type AbstractLazyBlob end
+
+"""
+    config_type(b::AbstractLazyBlob) -> Type
+
+The fetch-config type `b` resolves with. Defaults to [`NoConfig`](@ref); a blob
+backed by credentials or other parameters overrides it (e.g. [`LazyS3Blob`](@ref)
+uses [`S3Config`](@ref)), and `b()` then defaults `config` to that type's
+[`default_config`](@ref). The cache dir is *not* part of this — it is framework
+state (see [`cache_dir`](@ref)).
+"""
+config_type(::AbstractLazyBlob) = NoConfig
+
+"""
+    cache_subpath(b::AbstractLazyBlob) -> Tuple of path components
+
+The blob's location under the cache dir, as `/`-free path components that
+[`local_path`](@ref) joins onto the cache root and portability-checks. A concrete
+blob type defines this (or overrides `local_path` for full control of the layout).
+"""
+function cache_subpath end
+
+"""
+    fetch!(b::AbstractLazyBlob, dest::AbstractString; config, verbose=false)
+
+Download `b` to the path `dest`. Leave `dest` nonexistent (write nothing) **iff**
+the resource genuinely does not exist — [`resolve`](@ref) reads a missing `dest`
+as "not found" and returns `nothing`. Raise on any real failure (auth, network,
+timeout, 5xx): a failure must not masquerade as "not found". A concrete blob type
+defines this; `config` is of the blob's [`config_type`](@ref). (`resolve` removes
+a partial `dest` if `fetch!` throws.)
+"""
+function fetch! end
+
+# The cache root is mandatory for every blob; check it before touching the network.
+_require_cache_dir(dir) =
+    isempty(dir) && error("cache dir is not set — call cache_dir!(path) or pass cache_dir=")
+
+"""
+    validate_config(config, b::AbstractLazyBlob)
+
+Check `config` carries what *fetching* `b` needs, raising if not. Defaults to a
+no-op (most blobs need no fetch config); a blob type that needs credentials
+overrides it (e.g. [`LazyS3Blob`](@ref)). The cache dir is validated separately.
+"""
+validate_config(::Any, ::AbstractLazyBlob) = nothing
+
+"""
+    local_path(b::AbstractLazyBlob; cache_dir=cache_dir()) -> String
+
+The absolute cache path `b` resolves to: `cache_subpath(b)` joined onto the cache
+root, with the cross-OS portability / no-escape checks applied to every blob
+type. Override directly to take full control of the layout.
+"""
+local_path(b::AbstractLazyBlob; cache_dir = cache_dir()) =
+    _checked_path(cache_dir, cache_subpath(b)...)
+
+"""
+    resolve(b::AbstractLazyBlob; cache_dir=cache_dir(), config=default_config(config_type(b)), verbose=false) -> String | Nothing
+
+Resolve `b` to a local path: return the cached copy on a hit, otherwise
+[`fetch!`](@ref) it into the cache and return the new path. Returns `nothing`
+only when `fetch!` reports the resource absent. `cache_dir` defaults to the
+process-wide [`cache_dir`](@ref); `config` to the default for the blob's
+[`config_type`](@ref). Calling a blob — `b()` — forwards here.
+"""
+function resolve(
+        b::AbstractLazyBlob;
+        cache_dir = cache_dir(), config = default_config(config_type(b)), verbose::Bool = false
+    )
+    _require_cache_dir(cache_dir)
+    validate_config(config, b)
+    lp = local_path(b; cache_dir)
+    isfile(lp) && return lp
+    mkpath(dirname(lp))
+    # Fetch into a unique temp in the same dir, then rename: an interrupted run
+    # never caches a partial, and concurrent resolves of the same blob don't
+    # clobber each other. `cleanup=false`: we manage its lifecycle.
+    tmp = tempname(dirname(lp); cleanup = false)
+    try
+        fetch!(b, tmp; config, verbose)
+    catch
+        # `fetch!` may have written a partial before failing; never cache it.
+        isfile(tmp) && rm(tmp; force = true)
+        rethrow()
+    end
+    # A surviving `tmp` is the fetched object; its absence means `fetch!`
+    # reported the resource genuinely missing.
+    isfile(tmp) || return nothing
+    mv(tmp, lp; force = true)
+    return lp
+end
+
+(b::AbstractLazyBlob)(;
+    cache_dir = cache_dir(), config = default_config(config_type(b)), verbose::Bool = false) =
+    resolve(b; cache_dir, config, verbose)
 
 """
     s = LazyS3Blob(; bucket, name)
     s()  -> resolves to a local path, downloading on a cache miss; `nothing` if absent
 
 A handle to an object in an S3 bucket. Calling it returns the path to a local
-copy (under the config's cache dir), downloading the object on first use.
-Returns `nothing` only when the object does not exist; a genuine failure
-(auth, missing bucket, network) raises.
+copy (under the cache root), downloading the object on first use. Resolves with
+an [`S3Config`](@ref). Returns `nothing` only when the object does not exist; a
+genuine failure (auth, missing bucket, network) raises.
 """
 Base.@kwdef struct LazyS3Blob <: AbstractLazyBlob
     bucket::String
     name::String
 end
 
-local_path(config::Config, b::LazyS3Blob) = _checked_path(local_cache_dir(config), b.bucket, b.name)
+cache_subpath(b::LazyS3Blob) = (b.bucket, b.name)
+config_type(::LazyS3Blob) = S3Config
+validate_config(c::S3Config, ::LazyS3Blob) = validate_s3_config(c)
 
-function (b::LazyS3Blob)(; config::Config = DEFAULT_CONFIG[], verbose::Bool = false)
-    validate_s3_config(config)
-    lp = local_path(config, b)
-    isfile(lp) && return lp
-    mkpath(dirname(lp))
-    # Download to a unique temp in the same dir, then rename: an interrupted run
-    # never caches a partial, and concurrent resolves of the same blob don't
-    # clobber each other's download. `cleanup=false`: we manage its lifecycle.
-    tmp = tempname(dirname(lp); cleanup = false)
+function fetch!(b::LazyS3Blob, dest::AbstractString; config::S3Config, verbose::Bool = false)
     r = _with_rclone(config) do make_cmd
-        _run(make_cmd(`copyto $RCLONE_REMOTE:$(b.bucket)/$(b.name) $tmp`); verbose)
+        _run(make_cmd(`copyto $RCLONE_REMOTE:$(b.bucket)/$(b.name) $dest`); verbose)
     end
-    # rclone `copyto` exits 0 and writes nothing when the object is absent; a
-    # nonzero exit is a real failure (auth, missing bucket, network) and must
-    # be surfaced rather than masquerading as "not found".
-    if !r.ok
-        isfile(tmp) && rm(tmp; force = true)
-        error("download failed (rclone exit $(r.code)): $(strip(r.err))")
-    end
-    isfile(tmp) || return nothing
-    mv(tmp, lp; force = true)
-    return lp
+    # rclone `copyto` exits 0 and writes nothing when the object is absent (so
+    # `resolve` sees the missing `dest` as "not found"); a nonzero exit is a real
+    # failure (auth, missing bucket, network) and must surface, not masquerade as
+    # "not found".
+    r.ok || error("download failed (rclone exit $(r.code)): $(strip(r.err))")
+    return nothing
 end
 
 """
-    a = LazyArtifact(; url, name)
+    a = LazyArtifact(; url, name, timeout=$ARTIFACT_TIMEOUT)
     a()  -> resolves to a local path, downloading on a cache miss; `nothing` if absent
 
 A handle to a file at an HTTP(S) `url`. Calling it returns the path to a local
-copy (cached under `<cache>/_artifacts_/<name>`), downloading on first use.
-Only `local_cache_dir` is required in the config — no S3 credentials.
-Returns `nothing` only when the URL responds `404 Not Found`; a genuine failure
-(network, timeout, 5xx, …) raises rather than masquerading as "not found".
+copy (cached under `<cache>/_artifacts_/<name>`), downloading on first use, with
+at most `timeout` seconds per download. Needs no fetch config ([`NoConfig`](@ref))
+— only the cache root. Returns `nothing` only when the URL responds
+`404 Not Found`; a genuine failure (network, timeout, 5xx, …) raises rather than
+masquerading as "not found".
 """
 Base.@kwdef struct LazyArtifact <: AbstractLazyBlob
     url::String
     name::String
+    timeout::Int = ARTIFACT_TIMEOUT
 end
 
-local_path(config::Config, a::LazyArtifact) = _checked_path(local_cache_dir(config), "_artifacts_", a.name)
+cache_subpath(a::LazyArtifact) = ("_artifacts_", a.name)
 
-function (a::LazyArtifact)(; config::Config = DEFAULT_CONFIG[], verbose::Bool = false, timeout::Real = ARTIFACT_TIMEOUT)
-    validate_minimal_config(config)
-    lp = local_path(config, a)
-    isfile(lp) && return lp
-    mkpath(dirname(lp))
-    # Unique temp in the same dir, renamed on success: an interrupted run never
-    # caches a partial, and concurrent resolves don't clobber each other.
-    tmp = tempname(dirname(lp); cleanup = false)
+function fetch!(a::LazyArtifact, dest::AbstractString; config::NoConfig = NoConfig(), verbose::Bool = false)
     try
-        Downloads.download(a.url, tmp; timeout)
+        Downloads.download(a.url, dest; timeout = a.timeout)
     catch e
-        isfile(tmp) && rm(tmp; force = true)
-        # A 404 means the artifact genuinely isn't there: return `nothing`,
-        # mirroring the S3 path. Any other failure (network, timeout, 5xx, a
-        # bad cache path) is real and must surface, not look like "not found".
+        # A 404 means the artifact genuinely isn't there: drop any partial and
+        # leave `dest` absent so `resolve` returns `nothing`. Any other failure
+        # (network, timeout, 5xx) is real and must surface, not look like "not
+        # found".
         if e isa Downloads.RequestError && e.response.status == 404
+            isfile(dest) && rm(dest; force = true)
             verbose && @warn "artifact not found (404)" url = a.url
             return nothing
         end
         verbose && @warn "artifact download failed" url = a.url exception = e
         rethrow()
     end
-    isfile(tmp) || return nothing
-    mv(tmp, lp; force = true)
-    return lp
+    return nothing
 end
 
 # ---------------------------------------------------------------------------
@@ -219,23 +381,24 @@ function _prune_empty_dirs(dir::AbstractString, root::AbstractString)
 end
 
 """
-    clear_from_cache(b; config=DEFAULT_CONFIG[]) -> Bool
+    clear_from_cache(b; cache_dir=cache_dir()) -> Bool
 
 Remove the local cached copy of `b`, if present. Returns `true` if a file was
-removed, `false` if there was nothing cached.
+removed, `false` if there was nothing cached. Needs only the cache root, not any
+fetch config.
 """
-function clear_from_cache(b::AbstractLazyBlob; config::Config = DEFAULT_CONFIG[])
-    validate_minimal_config(config)
-    lp = local_path(config, b)
+function clear_from_cache(b::AbstractLazyBlob; cache_dir = cache_dir())
+    _require_cache_dir(cache_dir)
+    lp = local_path(b; cache_dir)
     isfile(lp) || return false
     rm(lp; force = true)
-    _prune_empty_dirs(dirname(lp), local_cache_dir(config))
+    _prune_empty_dirs(dirname(lp), cache_dir)
     return true
 end
 
 function s3_upload(
         local_file::AbstractString, bucket::AbstractString, name::Union{AbstractString, Nothing} = nothing;
-        config::Config = DEFAULT_CONFIG[], verbose::Bool = false
+        config::S3Config = default_config(S3Config), verbose::Bool = false
     )
     validate_s3_config(config)
     isfile(local_file) || error("not a file: $local_file")
@@ -300,7 +463,7 @@ function _parse_lsjson(out::AbstractString, bucket::AbstractString, pfx::Abstrac
 end
 
 """
-    s3_list_with_stats([pred,] bucket; prefix="", config=DEFAULT_CONFIG[]) -> Vector{S3Entry}
+    s3_list_with_stats([pred,] bucket; prefix="", config=default_config(S3Config)) -> Vector{S3Entry}
 
 List objects in `bucket` (recursively) as [`S3Entry`](@ref) records, each pairing a
 `LazyS3Blob` handle with the object's `size` (bytes) and `modified` time (the S3
@@ -326,7 +489,7 @@ place matches against each full key, i.e. `s3_list_with_stats(r, bucket)` ==
 """
 function s3_list_with_stats(
         bucket::AbstractString;
-        prefix::AbstractString = "", config::Config = DEFAULT_CONFIG[], verbose::Bool = false
+        prefix::AbstractString = "", config::S3Config = default_config(S3Config), verbose::Bool = false
     )
     validate_s3_config(config)
     # rclone lists the "directory" `bucket/pfx`; the keys come back relative to it.
@@ -348,7 +511,7 @@ s3_list_with_stats(re::Regex, bucket::AbstractString; kwargs...) =
     s3_list_with_stats(e -> occursin(re, e.blob.name), bucket; kwargs...)
 
 """
-    s3_list([pred,] bucket; prefix="", config=DEFAULT_CONFIG[]) -> Vector{LazyS3Blob}
+    s3_list([pred,] bucket; prefix="", config=default_config(S3Config)) -> Vector{LazyS3Blob}
 
 List objects in `bucket` (recursively) as `LazyS3Blob` handles. `prefix`, the
 optional `pred`, and the `Regex` shorthand all filter exactly as in
@@ -392,16 +555,16 @@ function _run(cmd::Cmd; verbose::Bool = false)
     return (; ok = success(proc), code = proc.exitcode, out = String(take!(out)), err = serr)
 end
 
-function _write_rclone_config(io::IO, c::Config)
+function _write_rclone_config(io::IO, c::S3Config)
     return write(
         io, """
         [$RCLONE_REMOTE]
         type = s3
         provider = AWS
-        access_key_id = $(c.s3_access_key_id)
-        secret_access_key = $(c.s3_secret_access_key)
-        region = $(c.s3_region)
-        location_constraint = $(c.s3_region)
+        access_key_id = $(c.access_key_id)
+        secret_access_key = $(c.secret_access_key)
+        region = $(c.region)
+        location_constraint = $(c.region)
         """
     )
 end
@@ -414,7 +577,7 @@ Write a temporary rclone config for `config` and call `f` with a closure
 `--config` flag. The flag goes before the subcommand so a `--` flag terminator
 inside `args` doesn't swallow it. The temp config is removed when `f` returns.
 """
-function _with_rclone(f, config::Config)
+function _with_rclone(f, config::S3Config)
     return mktemp() do path, io
         _write_rclone_config(io, config)
         close(io)
