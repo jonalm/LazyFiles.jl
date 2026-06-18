@@ -1,6 +1,6 @@
 name = "LazyFiles"
 uuid = "169830f2-f8ed-426a-92bf-62bee49d67e9"
-version = "0.3.0"
+version = "0.4.0"
 authors = ["Jon Alm Eriksen <jon.alm.eriksen@protonmail.com>"]
 
 [deps]
